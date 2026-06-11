@@ -1,5 +1,5 @@
 defaults:
-  - env/realworld_peg_insertion@env.train
+  - env/realworld_peg_insertion@env.train  #找到参数之后，重定位到env.train
   - env/realworld_peg_insertion@env.eval
   - model/cnn_policy@actor.model
   - training_backend/fsdp@actor.fsdp_config

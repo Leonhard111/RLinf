@@ -109,7 +109,7 @@ class PathEnvMergeMode(str, Enum):
 
 class Cluster:
     """A singleton class that manages the cluster resources for Ray workers."""
-
+    # 类属性，所有属性共享
     SYS_NAME = "RLinf"
     NAMESPACE = SYS_NAME
     LOGGING_LEVEL = os.getenv(

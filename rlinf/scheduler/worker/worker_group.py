@@ -191,6 +191,7 @@ class WorkerGroup(Generic[WorkerClsType]):
             self._worker_group_name = name
 
         self._create_workers()
+        # 这个函数会扫描 worker 类的方法，然后动态加到 WorkerGroup 实例上
         self._attach_cls_func()
         self._is_ready()
 
@@ -332,6 +333,7 @@ class WorkerGroup(Generic[WorkerClsType]):
                     f"Function {func_name} already exists in the {WorkerGroup.__name__} class, please rename it in the {self._worker_cls} class."
                 )
             else:
+                #  self是要挂载的对象；func_name是要挂载的方法的名称； WorkerGroupFunc(self, func_name)是要挂在的方法
                 setattr(self, func_name, WorkerGroupFunc(self, func_name))
 
         for func_name in hidden_func_list:

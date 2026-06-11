@@ -53,6 +53,7 @@ class EmbodiedRunner:
     def __init__(
         self,
         cfg: DictConfig,
+        # 这个类型注解好像不是很严谨
         actor: Union[
             "EmbodiedFSDPActor",
             "EmbodiedNFTFSDPPolicy",

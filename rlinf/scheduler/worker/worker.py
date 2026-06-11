@@ -548,7 +548,12 @@ class Worker(metaclass=WorkerMeta):
             kwargs: The keyword arguments of the class.
         """
         from .worker_group import WorkerGroup
-
+        # cls 指的是“调用这个方法的那个子类本身 /类对象
+        """
+        比如：
+        Worker.create_group() 时,cls 是 Worker
+        MyWorker.create_group() 时,cls 是 MyWorker
+        """
         return WorkerGroup(cls, args, kwargs)
 
     def send(
