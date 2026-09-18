@@ -29,6 +29,7 @@ from omegaconf import OmegaConf
 from rlinf.envs.realworld.venv import NoAutoResetSyncVectorEnv
 from rlinf.envs.utils import to_tensor
 from rlinf.scheduler import WorkerInfo
+from rlinf.utils.latency_logger import get_latency_logger
 
 
 class RealWorldEnv(gym.Env):
@@ -54,6 +55,26 @@ class RealWorldEnv(gym.Env):
         self.num_group = num_envs // cfg.group_size
         self.group_size = cfg.group_size
         self.main_image_key = cfg.main_image_key
+
+        def optional_ordered_keys(name):
+            value = cfg.get(name, None)
+            if value is None:
+                return None
+            if isinstance(value, str):
+                raise TypeError(f"{name} must be a list of observation keys")
+            keys = tuple(str(key) for key in value)
+            if not keys:
+                raise ValueError(f"{name} must not be empty when configured")
+            if len(keys) != len(set(keys)):
+                raise ValueError(f"{name} contains duplicate keys: {keys}")
+            return keys
+
+        # Defaults stay None so every existing real-world task preserves the
+        # previous sorted-state / extra-view behavior. Nero opts in explicitly.
+        self.model_state_keys = optional_ordered_keys("model_state_keys")
+        self.wrist_image_keys = optional_ordered_keys("wrist_image_keys")
+        if self.wrist_image_keys and self.main_image_key in self.wrist_image_keys:
+            raise ValueError("main_image_key must not also be a wrist_image_key")
         self.manual_episode_control_only = bool(
             self.override_cfg.get("manual_episode_control_only", False)
         )
@@ -249,7 +270,13 @@ class RealWorldEnv(gym.Env):
         obs = {}
 
         state = raw_obs["state"]
-        full_states = np.concatenate([state[k] for k in sorted(state)], axis=-1)
+        state_keys = self.model_state_keys or tuple(sorted(state))
+        missing_state_keys = [key for key in state_keys if key not in state]
+        if missing_state_keys:
+            raise KeyError(
+                f"model_state_keys missing from observation: {missing_state_keys}"
+            )
+        full_states = np.concatenate([state[key] for key in state_keys], axis=-1)
         obs["states"] = full_states
 
         frames = raw_obs["frames"]
@@ -258,13 +285,41 @@ class RealWorldEnv(gym.Env):
                 f"main_image_key {self.main_image_key!r} not in {list(frames)}"
             )
         obs["main_images"] = frames[self.main_image_key]
-        raw_images = OrderedDict(sorted(frames.items()))
-        raw_images.pop(self.main_image_key)
 
-        if raw_images:
-            obs["extra_view_images"] = np.stack(list(raw_images.values()), axis=1)
+        if self.wrist_image_keys is not None:
+            missing_wrist_keys = [
+                key for key in self.wrist_image_keys if key not in frames
+            ]
+            if missing_wrist_keys:
+                raise KeyError(
+                    f"wrist_image_keys missing from observation: {missing_wrist_keys}"
+                )
+            obs["wrist_images"] = np.stack(
+                [frames[key] for key in self.wrist_image_keys], axis=1
+            )
+            excluded = {self.main_image_key, *self.wrist_image_keys}
+            extra_images = [
+                frames[key] for key in sorted(frames) if key not in excluded
+            ]
+            if extra_images:
+                obs["extra_view_images"] = np.stack(extra_images, axis=1)
+        else:
+            raw_images = OrderedDict(sorted(frames.items()))
+            raw_images.pop(self.main_image_key)
+            if raw_images:
+                obs["extra_view_images"] = np.stack(list(raw_images.values()), axis=1)
 
-        obs = to_tensor(obs)
+        if "rtc" in raw_obs:
+            obs["rtc_context"] = raw_obs["rtc"]
+
+        # These arrays are snapshot-owned and remain alive until the transport
+        # finishes. from_numpy avoids another full image copy on the AgileX CPU.
+        obs = {
+            key: torch.from_numpy(value)
+            if isinstance(value, np.ndarray)
+            else to_tensor(value)
+            for key, value in obs.items()
+        }
         obs["task_descriptions"] = self.task_descriptions
         return obs
 
@@ -337,8 +392,40 @@ class RealWorldEnv(gym.Env):
             if callable(on_begin):
                 on_begin()
 
+    def _submit_native_action_chunk(self, chunk_actions) -> bool:
+        """Let a single hardware env consume its native chunk immediately.
+
+        Environments without ``submit_action_chunk`` keep the generic step loop.
+        Nero exposes this hook because its host controller already consumes one
+        complete policy generation, so waiting for the 50th Python/Gym step only
+        adds latency and does not change the command sent to the robot.
+        """
+
+        if self.num_envs != 1:
+            return False
+        env = self.env.envs[0]
+        try:
+            submit_chunk = env.get_wrapper_attr("submit_action_chunk")
+        except AttributeError:
+            return False
+        if not callable(submit_chunk):
+            return False
+
+        actions = chunk_actions
+        if isinstance(actions, torch.Tensor):
+            actions = actions.detach().cpu().numpy()
+        actions = np.asarray(actions)
+        if actions.ndim != 3 or actions.shape[0] != 1:
+            raise ValueError(
+                "native action chunk submission expects shape "
+                "[1, chunk_size, action_dim]"
+            )
+        submit_chunk(actions[0])
+        return True
+
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
+        chunk_started = time.perf_counter()
         chunk_size = chunk_actions.shape[1]
         obs_list = []
         infos_list = []
@@ -352,6 +439,9 @@ class RealWorldEnv(gym.Env):
         raw_chunk_intervene_flag = []
         raw_chunk_rlt_switch_flags = []
         self._notify_action_chunk_begin()
+        notified = time.perf_counter()
+        native_submitted = self._submit_native_action_chunk(chunk_actions)
+        submitted = time.perf_counter()
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
@@ -369,6 +459,7 @@ class RealWorldEnv(gym.Env):
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
 
+        expanded = time.perf_counter()
         chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
         raw_chunk_terminations = torch.stack(
             raw_chunk_terminations, dim=1
@@ -408,6 +499,21 @@ class RealWorldEnv(gym.Env):
         else:
             chunk_terminations = raw_chunk_terminations.clone()
             chunk_truncations = raw_chunk_truncations.clone()
+        if native_submitted:
+            finished = time.perf_counter()
+            get_latency_logger("realworld_chunk").record(
+                {
+                    "notify_chunk_begin": (notified - chunk_started) * 1000.0,
+                    "native_submit": (submitted - notified) * 1000.0,
+                    "expand_gym_steps": (expanded - submitted) * 1000.0,
+                    "stack_and_finalize": (finished - expanded) * 1000.0,
+                    "chunk_step_total": (finished - chunk_started) * 1000.0,
+                },
+                metadata={
+                    "chunk_size": int(chunk_size),
+                    "action_shape": list(chunk_actions.shape),
+                },
+            )
         return (
             obs_list,
             chunk_rewards,

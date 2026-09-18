@@ -43,6 +43,71 @@ _PALIGEMMA_WIDTH = 2048
 _ACTION_WIDTH = 1024
 
 
+def _unwrap_value_wrappers(tree):
+    """Remove Orbax ``{"value": array}`` variable wrappers recursively.
+
+    OpenPI LoRA checkpoints saved from a training state wrap both frozen dense
+    parameters and trainable LoRA/projection parameters in a one-key ``value``
+    mapping.  Dense reference checkpoints do not necessarily use this wrapper.
+    Normalizing the tree once keeps every converter below compatible with both
+    layouts and avoids silently treating a wrapper as a tensor.
+    """
+    if isinstance(tree, dict):
+        if set(tree) == {"value"}:
+            return _unwrap_value_wrappers(tree["value"])
+        return {key: _unwrap_value_wrappers(value) for key, value in tree.items()}
+    if isinstance(tree, list):
+        return [_unwrap_value_wrappers(value) for value in tree]
+    if isinstance(tree, tuple):
+        return tuple(_unwrap_value_wrappers(value) for value in tree)
+    return tree
+
+
+def _merge_lora_weight(
+    node: dict,
+    *,
+    base_key: str,
+    lora_a_key: str,
+    lora_b_key: str,
+    scale: float,
+) -> np.ndarray:
+    """Return ``W + scale * A @ B`` while preserving all prefix axes."""
+    base = np.asarray(node[base_key], dtype=np.float32)
+    has_a = lora_a_key in node
+    has_b = lora_b_key in node
+    if not has_a and not has_b:
+        return base
+    if has_a != has_b:
+        missing = lora_b_key if has_a else lora_a_key
+        raise ValueError(f"incomplete LoRA pair for {base_key}: missing {missing}")
+
+    lora_a = np.asarray(node[lora_a_key], dtype=np.float32)
+    lora_b = np.asarray(node[lora_b_key], dtype=np.float32)
+    if lora_a.ndim < 2 or lora_b.ndim < 2:
+        raise ValueError(f"LoRA tensors for {base_key} must be at least 2D")
+    if lora_a.shape[:-2] != lora_b.shape[:-2]:
+        raise ValueError(
+            f"LoRA prefix mismatch for {base_key}: "
+            f"{lora_a.shape[:-2]} != {lora_b.shape[:-2]}"
+        )
+    if lora_a.shape[-1] != lora_b.shape[-2]:
+        raise ValueError(
+            f"LoRA rank mismatch for {base_key}: "
+            f"{lora_a.shape[-1]} != {lora_b.shape[-2]}"
+        )
+    expected_shape = lora_a.shape[:-1] + (lora_b.shape[-1],)
+    if base.shape != expected_shape:
+        raise ValueError(
+            f"LoRA/base shape mismatch for {base_key}: "
+            f"base={base.shape}, merged={expected_shape}"
+        )
+    if not np.isfinite(scale):
+        raise ValueError(f"LoRA scale for {base_key} must be finite")
+
+    update = np.matmul(lora_a, lora_b)
+    return np.add(base, update * np.float32(scale), dtype=np.float32)
+
+
 def _load_jax_params(checkpoint_dir: str | pathlib.Path) -> dict:
     """Restore the JAX parameter pytree from ``{checkpoint_dir}/params`` as float32 numpy.
 
@@ -69,6 +134,7 @@ def _load_jax_params(checkpoint_dir: str | pathlib.Path) -> dict:
     restored = jax.tree_util.tree_map(
         lambda x: np.asarray(x, dtype=np.float32), restored
     )
+    restored = _unwrap_value_wrappers(restored)
     # Some orbax checkpoints (e.g. the pi05_base reference) wrap the parameter
     # tree under a top-level ``params`` collection; the converters expect the
     # unwrapped tree (``PaliGemma`` / ``action_in_proj`` / ... at the top), so
@@ -147,7 +213,13 @@ def convert_siglip(params: dict) -> dict:
     return pt
 
 
-def convert_llm(params: dict, pi05: bool) -> dict:
+def convert_llm(
+    params: dict,
+    pi05: bool,
+    *,
+    paligemma_lora_scale: float = 1.0,
+    action_lora_scale: float = 1.0,
+) -> dict:
     """Convert the dual-expert Gemma LLM (PaliGemma + action expert) from JAX to PyTorch."""
     pt: dict[str, torch.Tensor] = {}
     llm = params["PaliGemma"]["llm"]
@@ -158,19 +230,79 @@ def convert_llm(params: dict, pi05: bool) -> dict:
     layers = llm["layers"]
     pg_w, act_w = _PALIGEMMA_WIDTH, _ACTION_WIDTH
 
-    q_einsum = layers["attn"]["q_einsum"]["w"]
-    kv_einsum = layers["attn"]["kv_einsum"]["w"]
-    o_einsum = layers["attn"]["attn_vec_einsum"]["w"]
-    mlp_gating = layers["mlp"]["gating_einsum"]
-    mlp_linear = layers["mlp"]["linear"]
+    q_einsum = _merge_lora_weight(
+        layers["attn"]["q_einsum"],
+        base_key="w",
+        lora_a_key="lora_a",
+        lora_b_key="lora_b",
+        scale=paligemma_lora_scale,
+    )
+    kv_einsum = _merge_lora_weight(
+        layers["attn"]["kv_einsum"],
+        base_key="w",
+        lora_a_key="lora_a",
+        lora_b_key="lora_b",
+        scale=paligemma_lora_scale,
+    )
+    o_einsum = _merge_lora_weight(
+        layers["attn"]["attn_vec_einsum"],
+        base_key="w",
+        lora_a_key="lora_a",
+        lora_b_key="lora_b",
+        scale=paligemma_lora_scale,
+    )
+    mlp_gating = _merge_lora_weight(
+        layers["mlp"],
+        base_key="gating_einsum",
+        lora_a_key="gating_einsum_lora_a",
+        lora_b_key="gating_einsum_lora_b",
+        scale=paligemma_lora_scale,
+    )
+    mlp_linear = _merge_lora_weight(
+        layers["mlp"],
+        base_key="linear",
+        lora_a_key="linear_lora_a",
+        lora_b_key="linear_lora_b",
+        scale=paligemma_lora_scale,
+    )
     pre_attn_scale = layers["pre_attention_norm"]["scale"]
     pre_ffw_scale = layers["pre_ffw_norm"]["scale"]
 
-    q_einsum_1 = layers["attn"]["q_einsum_1"]["w"]
-    kv_einsum_1 = layers["attn"]["kv_einsum_1"]["w"]
-    o_einsum_1 = layers["attn"]["attn_vec_einsum_1"]["w"]
-    mlp_gating_1 = layers["mlp_1"]["gating_einsum"]
-    mlp_linear_1 = layers["mlp_1"]["linear"]
+    q_einsum_1 = _merge_lora_weight(
+        layers["attn"]["q_einsum_1"],
+        base_key="w",
+        lora_a_key="lora_a",
+        lora_b_key="lora_b",
+        scale=action_lora_scale,
+    )
+    kv_einsum_1 = _merge_lora_weight(
+        layers["attn"]["kv_einsum_1"],
+        base_key="w",
+        lora_a_key="lora_a",
+        lora_b_key="lora_b",
+        scale=action_lora_scale,
+    )
+    o_einsum_1 = _merge_lora_weight(
+        layers["attn"]["attn_vec_einsum_1"],
+        base_key="w",
+        lora_a_key="lora_a",
+        lora_b_key="lora_b",
+        scale=action_lora_scale,
+    )
+    mlp_gating_1 = _merge_lora_weight(
+        layers["mlp_1"],
+        base_key="gating_einsum",
+        lora_a_key="gating_einsum_lora_a",
+        lora_b_key="gating_einsum_lora_b",
+        scale=action_lora_scale,
+    )
+    mlp_linear_1 = _merge_lora_weight(
+        layers["mlp_1"],
+        base_key="linear",
+        lora_a_key="linear_lora_a",
+        lora_b_key="linear_lora_b",
+        scale=action_lora_scale,
+    )
 
     n_layers = q_einsum.shape[0]
     for i in range(n_layers):
@@ -286,6 +418,8 @@ def convert(
     action_expert_variant: str = "gemma_300m",
     pcd: bool = False,
     dtype: str = "bfloat16",
+    paligemma_lora_scale: float = 1.0,
+    action_lora_scale: float = 1.0,
 ) -> pathlib.Path:
     """Convert a JAX checkpoint dir to an OpenPI_RLinf checkpoint.
 
@@ -300,7 +434,12 @@ def convert(
     merged: dict[str, torch.Tensor] = {}
     for part in (
         convert_siglip(params),
-        convert_llm(params, pi05),
+        convert_llm(
+            params,
+            pi05,
+            paligemma_lora_scale=paligemma_lora_scale,
+            action_lora_scale=action_lora_scale,
+        ),
         convert_projections(params, pi05),
     ):
         for k, v in part.items():
@@ -344,6 +483,18 @@ def add_arguments(parser) -> None:
     parser.add_argument("--max-token-len", type=int, default=200)
     parser.add_argument("--paligemma-variant", default="gemma_2b")
     parser.add_argument("--action-expert-variant", default="gemma_300m")
+    parser.add_argument(
+        "--paligemma-lora-scale",
+        type=float,
+        default=1.0,
+        help="dense merge scale for PaliGemma LoRA (alpha/rank)",
+    )
+    parser.add_argument(
+        "--action-lora-scale",
+        type=float,
+        default=1.0,
+        help="dense merge scale for action-expert LoRA (alpha/rank)",
+    )
 
 
 def run(args) -> None:
@@ -359,4 +510,6 @@ def run(args) -> None:
         max_token_len=args.max_token_len,
         paligemma_variant=args.paligemma_variant,
         action_expert_variant=args.action_expert_variant,
+        paligemma_lora_scale=args.paligemma_lora_scale,
+        action_lora_scale=args.action_lora_scale,
     )

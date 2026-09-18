@@ -34,6 +34,12 @@ JAX Pi0/Pi05 orbax checkpoint -> OpenPI_RLinf bare `Pi0` layout.
   pytree). The `--input-norm-stats` path points at the matching
   `norm_stats.json`. Requires `jax` / `orbax` installed (imported lazily, only
   when this mode runs).
+- **LoRA checkpoints**: OpenPI training-state wrappers of the form
+  `{"value": array}` are unwrapped recursively. Attention and FFN LoRA pairs
+  are merged into dense weights as `W + scale * A @ B` before the existing
+  JAX-to-PyTorch layout transform. Both dense checkpoints and dual-expert LoRA
+  checkpoints are accepted; an incomplete A/B pair or incompatible shape fails
+  loudly.
 - **Output**: `<output-model>/model.safetensors` + `<output-model>/config.json`;
   norm-stats copied to `--output-norm-stats`.
 - **Dtype policy**: weights are written in **fp32**, but the emitted
@@ -50,6 +56,12 @@ python -m rlinf.utils.ckpt_convertor.openpi.convert --mode jax_to_openpi_rlinf \
 
 Optional shape flags: `--no-pi05`, `--action-dim`, `--action-horizon`,
 `--max-token-len`, `--paligemma-variant`, `--action-expert-variant`.
+
+For LoRA inputs, also set `--paligemma-lora-scale` and
+`--action-lora-scale` to the training configuration's `alpha / rank`. Both
+default to `1.0`; this is correct for OpenPI's `gemma_2b_lora` (16/16) and
+`gemma_300m_lora` (32/32). The scale is not encoded in the Orbax parameter
+leaves, so do not guess a different checkpoint's values.
 
 ---
 

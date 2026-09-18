@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Literal, Sequence
 
@@ -27,9 +29,14 @@ from rlinf.models.embodiment.openpi_rlinf.openpi_action_model import (
 from rlinf.models.embodiment.openpi_rlinf.pi0_model import model as pi0_model_module
 from rlinf.models.embodiment.openpi_rlinf.pi0_model.model import Observation
 from rlinf.models.embodiment.openpi_rlinf.pi0_model.pi0 import Pi0
+from rlinf.models.embodiment.openpi_rlinf.rtc import (
+    RTCModelContext,
+    align_previous_chunk,
+)
 from rlinf.models.embodiment.openpi_rlinf.utils.rlt_utils import (
     OpenPiPytorchRLTConfig,
 )
+from rlinf.utils.latency_logger import get_latency_logger
 
 
 def _to_numpy(x):
@@ -82,6 +89,10 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         # openpi.transforms pipeline state (installed by :meth:`setup_wrappers`).
         self._input_transform_fn = None
         self._output_transform_fn = None
+        self._latency_profile = os.environ.get("RLINF_PI05_LATENCY_PROFILE") == "1"
+        self._latency_logger = get_latency_logger("pi05_inference")
+        self._rtc_previous_model_actions: torch.Tensor | None = None
+        self._rtc_previous_generation_id: int | None = None
 
     # -------------------------------------------------------- transforms glue
 
@@ -219,8 +230,11 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
                 sample["prompt"] = "xxxx"
             batch_samples.append(sample)
 
-        with ThreadPoolExecutor(max_workers=min(len(batch_samples), 8)) as ex:
-            transformed = list(ex.map(self._input_transform_fn, batch_samples))
+        if len(batch_samples) == 1:
+            transformed = [self._input_transform_fn(batch_samples[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=min(len(batch_samples), 8)) as ex:
+                transformed = list(ex.map(self._input_transform_fn, batch_samples))
 
         recombined = tree_map(
             lambda *xs: torch.from_numpy(np.asarray(xs).copy()),
@@ -306,6 +320,11 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         :class:`NotImplementedError` so an eval-only model loudly refuses to
         be used for on-policy rollouts.
         """
+        profile = self._latency_profile
+        measure_latency = profile or self._latency_logger.enabled
+        if measure_latency:
+            torch.cuda.synchronize()
+            total_started = time.perf_counter()
         del compute_values, kwargs  # accepted for call-site parity; eval ignores them
         if mode != "eval":
             raise NotImplementedError(
@@ -313,10 +332,62 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
                 "use the RL subclass (actor.model.openpi.task='rl') for train rollouts."
             )
         # openpi.transforms pipeline (eval / RL).
+        rtc_context = RTCModelContext.from_tensor(env_obs.get("rtc_context"))
         repacked = self._repack_env_obs(env_obs)
+        if measure_latency:
+            repack_finished = time.perf_counter()
         processed = self.input_transform(repacked, transpose=False)
+        if measure_latency:
+            input_transform_finished = time.perf_counter()
         observation = self._observation_dict_to_device(processed)
-        return self._predict_eval(observation, noise=noise, rng=rng)
+        if measure_latency:
+            torch.cuda.synchronize()
+            preprocess_finished = time.perf_counter()
+
+        latency_metrics: dict[str, float] | None = {} if measure_latency else None
+        actions, result = self._predict_eval(
+            observation,
+            noise=noise,
+            rng=rng,
+            rtc_context=rtc_context,
+            latency_metrics=latency_metrics,
+        )
+        if measure_latency:
+            torch.cuda.synchronize()
+            total_finished = time.perf_counter()
+            assert latency_metrics is not None
+            latency_metrics.update({
+                "repack": (repack_finished - total_started) * 1000.0,
+                "input_transform": (input_transform_finished - repack_finished)
+                * 1000.0,
+                "to_device": (preprocess_finished - input_transform_finished) * 1000.0,
+                "preprocess_total": (preprocess_finished - total_started) * 1000.0,
+                "total": (total_finished - total_started) * 1000.0,
+            })
+            self._latency_logger.record(
+                latency_metrics,
+                metadata={
+                    "batch_size": int(actions.shape[0]),
+                    "num_steps": int(self.num_steps),
+                    "action_shape": list(actions.shape),
+                    "rtc_enabled": bool(
+                        rtc_context is not None and rtc_context.enabled
+                    ),
+                },
+            )
+        if profile:
+            assert latency_metrics is not None
+            print(
+                "[PI05 latency] "
+                f"repack={latency_metrics['repack']:.2f} ms, "
+                f"input_transform={latency_metrics['input_transform']:.2f} ms, "
+                f"to_device={latency_metrics['to_device']:.2f} ms, "
+                f"preprocess={latency_metrics['preprocess_total']:.2f} ms, "
+                f"sample_actions={latency_metrics['sample_actions']:.2f} ms, "
+                f"output_transform={latency_metrics['output_transform']:.2f} ms, "
+                f"total={latency_metrics['total']:.2f} ms"
+            )
+        return actions, result
 
     def _predict_eval(
         self,
@@ -324,6 +395,8 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         *,
         noise: torch.Tensor | None,
         rng: torch.Generator | None,
+        rtc_context: RTCModelContext | None = None,
+        latency_metrics: dict[str, float] | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Deterministic Euler ODE sampler shared by eval and the RL eval path.
 
@@ -333,12 +406,50 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         :class:`huggingface_worker.HuggingFaceWorker.predict` expects from an
         eval call.
         """
-        model_actions = self.model.sample_actions(
-            observation, num_steps=self.num_steps, noise=noise, rng=rng
-        )
-        env_outputs = self.output_transform(
-            {"actions": model_actions, "state": observation.state}
-        )
+        measure_latency = latency_metrics is not None
+        if measure_latency:
+            model_started = time.perf_counter()
+
+        if rtc_context is not None and rtc_context.enabled:
+            if self._rtc_previous_model_actions is None:
+                raise RuntimeError("RTC guidance requested before a first policy chunk")
+            if self._rtc_previous_generation_id != rtc_context.previous_generation_id:
+                raise RuntimeError(
+                    "RTC previous generation mismatch: "
+                    f"model={self._rtc_previous_generation_id}, "
+                    f"request={rtc_context.previous_generation_id}"
+                )
+            previous_aligned = align_previous_chunk(
+                self._rtc_previous_model_actions,
+                rtc_context.execution_horizon_steps,
+            )
+            model_actions = self.model.sample_actions_rtc(
+                observation,
+                previous_aligned=previous_aligned,
+                inference_delay_steps=rtc_context.predicted_delay_steps,
+                prefix_attention_horizon=(
+                    self.model.action_horizon - rtc_context.execution_horizon_steps
+                ),
+                prefix_attention_schedule=rtc_context.prefix_attention_schedule,
+                max_guidance_weight=rtc_context.max_guidance_weight,
+                num_steps=self.num_steps,
+                noise=noise,
+                rng=rng,
+            )
+        else:
+            model_actions = self.model.sample_actions(
+                observation, num_steps=self.num_steps, noise=noise, rng=rng
+            )
+        if rtc_context is not None:
+            self._rtc_previous_model_actions = model_actions.detach().clone()
+            self._rtc_previous_generation_id = rtc_context.response_generation_id
+        if measure_latency:
+            torch.cuda.synchronize()
+            model_finished = time.perf_counter()
+        env_outputs = self.output_transform({
+            "actions": model_actions,
+            "state": observation.state,
+        })
         # openpi Unnormalize runs in float64; cast env actions back to float32 to
         # match the legacy eval processor's ``.astype(np.float32)`` contract (and
         # the action dtype the env/rollout worker expects).
@@ -352,6 +463,15 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
                 "model_action": model_actions.reshape(B, -1).contiguous(),
             },
         }
+        if measure_latency:
+            torch.cuda.synchronize()
+            output_finished = time.perf_counter()
+            assert latency_metrics is not None
+            latency_metrics.update({
+                "sample_actions": (model_finished - model_started) * 1000.0,
+                "output_transform": (output_finished - model_finished) * 1000.0,
+            })
+
         return actions, result
 
     @torch.no_grad()
@@ -380,9 +500,10 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
             prefix_mask,
             kv_cache,
         )
-        ref_chunk = self.output_transform(
-            {"actions": model_actions, "state": observation.state}
-        )["actions"]
+        ref_chunk = self.output_transform({
+            "actions": model_actions,
+            "state": observation.state,
+        })["actions"]
 
         raw_proprio = self._select_configured_state(env_obs["states"])
         if "maniskill" in self.config_name.lower():

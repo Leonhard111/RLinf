@@ -34,6 +34,7 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
+from rlinf.utils.latency_logger import get_latency_logger
 from rlinf.utils.placement import HybridComponentPlacement
 
 
@@ -43,6 +44,12 @@ class MultiStepRolloutWorker(Worker):
 
         self.cfg = cfg
         self.should_stop = False
+        self.eval_enable_p2p = bool(cfg.runner.get("eval_enable_p2p", False))
+        self.eval_p2p_tensor_actions = bool(
+            cfg.runner.get("eval_p2p_tensor_actions", False)
+        )
+        self._eval_transport_logger = None
+        self._eval_transport_sequence = 0
 
         self.only_eval = cfg.runner.get("only_eval", False)
         self.algorithm_cfg = cfg.get("algorithm", {})
@@ -801,6 +808,18 @@ class MultiStepRolloutWorker(Worker):
 
     @Worker.timer("evaluate")
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
+        if self._eval_transport_logger is None:
+            self._eval_transport_logger = get_latency_logger("eval_rollout_transport")
+        if self.eval_p2p_tensor_actions:
+            if not self.eval_enable_p2p:
+                raise ValueError(
+                    "eval_p2p_tensor_actions requires runner.eval_enable_p2p=true"
+                )
+            if self._world_size != 1 or self.num_pipeline_stages != 1:
+                raise ValueError(
+                    "eval_p2p_tensor_actions only supports one Rollout worker and "
+                    "one evaluation pipeline stage"
+                )
         if self.enable_offload:
             self.reload_model()
         if self.env_decoupled_mode:
@@ -842,6 +861,7 @@ class MultiStepRolloutWorker(Worker):
             ):
                 for _ in range(self.n_eval_chunk_steps):
                     for stage_id in range(self.num_pipeline_stages):
+                        turn_started = time.perf_counter()
                         env_output = await self.recv_from(
                             group_name=self.cfg.env.group_name,
                             channel=input_channel,
@@ -851,7 +871,9 @@ class MultiStepRolloutWorker(Worker):
                             batch_size=self.eval_batch_size,
                             merge_fn=self._merge_obs_batches,
                             infer_batch_size_fn=self._infer_env_batch_size,
+                            enable_p2p=self.eval_enable_p2p,
                         ).async_wait()
+                        observation_received = time.perf_counter()
                         actions, _ = self._predict_rollout_actions(
                             env_output["obs"],
                             mode="eval",
@@ -859,16 +881,75 @@ class MultiStepRolloutWorker(Worker):
                             rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                             intervene_requested=env_output.get("intervene_flags", None),
                         )
+                        prediction_finished = time.perf_counter()
                         if isinstance(actions, torch.Tensor):
-                            actions = actions.detach().cpu().contiguous()
-                        self.send_to(
-                            group_name=self.cfg.env.group_name,
-                            channel=output_channel,
-                            data=actions,
-                            tag="eval_rollout_results",
-                            route_key=stage_id,
-                            async_op=True,
-                            batch_size=self.eval_batch_size,
+                            actions = (
+                                actions.detach()
+                                .to(device="cpu", dtype=torch.float32)
+                                .contiguous()
+                            )
+                        action_ready = time.perf_counter()
+                        if self.eval_p2p_tensor_actions:
+                            expected_shape = (
+                                self.eval_batch_size,
+                                self.model_cfg.num_action_chunks,
+                                self.model_cfg.action_dim,
+                            )
+                            if not isinstance(actions, torch.Tensor):
+                                raise TypeError(
+                                    "eval_p2p_tensor_actions requires Tensor actions"
+                                )
+                            if tuple(actions.shape) != expected_shape:
+                                raise ValueError(
+                                    "Unexpected evaluation action shape: "
+                                    f"got {tuple(actions.shape)}, expected "
+                                    f"{expected_shape}"
+                                )
+                            self.send_tensor(
+                                actions,
+                                dst_group_name=self.cfg.env.group_name,
+                                dst_rank=0,
+                            )
+                        else:
+                            self.send_to(
+                                group_name=self.cfg.env.group_name,
+                                channel=output_channel,
+                                data=actions,
+                                tag="eval_rollout_results",
+                                route_key=stage_id,
+                                async_op=not self.eval_enable_p2p,
+                                batch_size=self.eval_batch_size,
+                                enable_p2p=self.eval_enable_p2p,
+                            )
+                        action_sent = time.perf_counter()
+                        self._eval_transport_sequence += 1
+                        self._eval_transport_logger.record(
+                            {
+                                "wait_observation": (
+                                    observation_received - turn_started
+                                )
+                                * 1000.0,
+                                "predict_actions": (
+                                    prediction_finished - observation_received
+                                )
+                                * 1000.0,
+                                "action_to_cpu": (action_ready - prediction_finished)
+                                * 1000.0,
+                                "send_action": (action_sent - action_ready) * 1000.0,
+                                "rollout_turn_total": (action_sent - turn_started)
+                                * 1000.0,
+                            },
+                            trace_id=self._eval_transport_sequence,
+                            metadata={
+                                "stage_id": stage_id,
+                                "transport": (
+                                    "p2p_tensor_action"
+                                    if self.eval_p2p_tensor_actions
+                                    else "p2p"
+                                    if self.eval_enable_p2p
+                                    else "channel"
+                                ),
+                            },
                         )
 
             if self.enable_offload:

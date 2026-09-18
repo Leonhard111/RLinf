@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rlinf.example/schemas/nero-contract-1.0.0.json",
+  "title": "RLinf AgileX Nero protocol metadata",
+  "type": "object",
+  "required": ["protocol_version", "sequence_id", "monotonic_timestamp_ns"],
+  "properties": {
+    "protocol_version": {"const": "nero-contract/1.0.0"},
+    "sequence_id": {"type": "integer", "minimum": 0},
+    "monotonic_timestamp_ns": {"type": "integer", "minimum": 1},
+    "representation": {"enum": ["absolute", "delta"]},
+    "mode": {"enum": ["shadow", "hold", "publish", "intervention", "stop"]},
+    "intervened": {"type": "boolean"},
+    "error_code": {
+      "enum": [
+        null,
+        "protocol_mismatch",
+        "stale_observation",
+        "invalid_action",
+        "publisher_conflict",
+        "risk_unsafe",
+        "heartbeat_timeout",
+        "bridge_fault"
+      ]
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,97 @@
+defaults:
+  - env/nero@env.eval
+  - model/pi0_5_rlinf@rollout.model
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 2
+  component_placement:
+    rollout:
+      node_group: gpu
+      placement: 0
+    env:
+      node_group: nero
+      placement: 0
+  node_groups:
+    - label: gpu
+      node_ranks: 0
+      env_configs:
+        - node_ranks: 0
+          env_vars:
+            # 192.168.50.102: cross-node Ray/Gloo interface on rcir.
+            - GLOO_SOCKET_IFNAME: enp0s31f6
+    - label: nero
+      node_ranks: 1
+      env_configs:
+        - node_ranks: 1
+          env_vars:
+            # 192.168.50.108: cross-node Ray/Gloo interface on AgileX Nero.
+            - GLOO_SOCKET_IFNAME: eno1
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: ../results
+    project_name: rlinf
+    experiment_name: nero_pi05_rlinf_shadow
+    logger_backends: [tensorboard]
+  only_eval: true
+  max_epochs: 1
+  max_steps: 10
+  val_check_interval: -1
+  save_interval: -1
+
+env:
+  group_name: EnvGroup
+  enable_offload: false
+  eval:
+    total_num_envs: 1
+    max_steps_per_rollout_epoch: 10
+    max_episode_steps: 10
+    video_cfg:
+      save_video: false
+    override_cfg:
+      mode: shadow
+      bridge_endpoint: tcp://127.0.0.1:5555
+      action_representation: absolute
+      heartbeat_interval_s: 0.1
+      heartbeat_timeout_s: 0.2
+
+rollout:
+  group_name: RolloutGroup
+  backend: huggingface
+  recompute_logprobs: false
+  enable_offload: false
+  pipeline_stage_num: 1
+  collect_transitions: false
+  collect_prev_infos: false
+  model:
+    model_type: openpi_rlinf
+    model_path: /workspace/fjh/checkpoints/pi05_base_openpi_rlinf
+    precision: bf16
+    pi05: true
+    num_action_chunks: 50
+    action_dim: 16
+    use_proprio: true
+    num_steps: 5
+    add_value_head: false
+    openpi_data:
+      norm_stats_path: ${..model_path}/local/nero_aloha16/norm_stats.json
+    openpi:
+      task: eval
+      config_name: pi05_nero
+      num_images_in_input: 3
+      action_chunk: ${..num_action_chunks}
+      action_env_dim: ${..action_dim}
+      model_action_dim: 32
+      paligemma_variant: gemma_2b
+      action_expert_variant: gemma_300m
+      max_token_len: 200
+      discrete_state_input: true

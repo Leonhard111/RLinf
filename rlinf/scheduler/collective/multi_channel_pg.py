@@ -13,8 +13,9 @@
 # limitations under the License.
 
 import logging
+import os
 from datetime import timedelta
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -52,6 +53,65 @@ def _empty_pinned(
     if buffer.is_pinned():
         return buffer
     return torch.empty(shape, dtype=dtype).pin_memory(device_type)
+
+
+def _create_gloo_process_group(
+    process_group_gloo: Any,
+    store: Any,
+    group_rank: int,
+    group_size: int,
+    timeout: timedelta,
+) -> Any:
+    """Create Gloo with devices from ``GLOO_SOCKET_IFNAME`` when configured.
+
+    RLinf constructs ``ProcessGroupGloo`` directly instead of calling
+    ``torch.distributed.init_process_group``. The direct constructor does not
+    reliably apply ``GLOO_SOCKET_IFNAME`` in the PyTorch version used by the
+    real-world containers, so create and attach the devices explicitly.
+    """
+    interface_names = [
+        name.strip()
+        for name in os.getenv("GLOO_SOCKET_IFNAME", "").split(",")
+        if name.strip()
+    ]
+    device_kwargs: list[dict[str, str]] = [
+        {"interface": name} for name in interface_names
+    ]
+    if not device_kwargs:
+        try:
+            import ray
+
+            node_ip_address = ray.util.get_node_ip_address()
+        except Exception as error:
+            if group_size > 1:
+                raise RuntimeError(
+                    "Gloo could not resolve this Ray node's routable IP; set "
+                    "GLOO_SOCKET_IFNAME explicitly"
+                ) from error
+        else:
+            if group_size > 1 and node_ip_address.startswith("127."):
+                raise RuntimeError(
+                    "Gloo resolved a loopback Ray node IP for a multi-node group: "
+                    f"{node_ip_address}"
+                )
+            device_kwargs = [{"hostname": node_ip_address}]
+
+    if not device_kwargs:
+        return process_group_gloo(store, group_rank, group_size, timeout=timeout)
+
+    options_cls = getattr(process_group_gloo, "_Options", None)
+    if options_cls is None:
+        raise RuntimeError(
+            "GLOO_SOCKET_IFNAME is configured, but this PyTorch build does "
+            "not expose ProcessGroupGloo._Options for explicit devices."
+        )
+
+    options = options_cls()
+    options._timeout = timeout
+    options._devices = [
+        process_group_gloo.create_device(**kwargs) for kwargs in device_kwargs
+    ]
+    return process_group_gloo(store, group_rank, group_size, options)
 
 
 class MultiChannelProcessGroup:
@@ -854,8 +914,12 @@ class MultiChannelProcessGroup:
                 # TODO: remove this check after lazy initialization is supported
                 # if pg_options is not None:
                 #     raise RuntimeError("GLOO options not supported")
-                backend_class = ProcessGroupGloo(
-                    backend_prefix_store, group_rank, group_size, timeout=timeout
+                backend_class = _create_gloo_process_group(
+                    ProcessGroupGloo,
+                    backend_prefix_store,
+                    group_rank,
+                    group_size,
+                    timeout,
                 )
                 backend_type = ProcessGroup.BackendType.GLOO
             elif backend_str == Backend.NCCL:

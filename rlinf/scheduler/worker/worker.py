@@ -15,6 +15,7 @@
 import ctypes
 import functools
 import inspect
+import ipaddress
 import logging
 import os
 import signal
@@ -46,6 +47,49 @@ if TYPE_CHECKING:
     from .worker_group import WorkerGroup
 
 WorkerClsType = TypeVar("WorkerClsType")
+
+
+def _get_ray_node_ip_address() -> str:
+    """Return the current node's cluster-reachable Ray address.
+
+    ``ray.util.get_node_ip_address()`` may return a hostname-derived loopback
+    address inside a host-networked container even though the Ray cluster has
+    registered the node with its reachable LAN address. Match the runtime node
+    ID against Ray's node table first so collectives advertise the same address
+    that Ray uses for cross-node scheduling.
+    """
+    try:
+        alive_nodes = [node for node in ray.nodes() if node.get("Alive", True)]
+    except Exception:
+        alive_nodes = []
+
+    try:
+        runtime_node_id = str(ray.get_runtime_context().get_node_id())
+        for node in alive_nodes:
+            if str(node.get("NodeID", "")) != runtime_node_id:
+                continue
+            node_ip = node.get("NodeManagerAddress")
+            if node_ip:
+                return str(node_ip)
+    except Exception:
+        # Preserve the previous behavior when the runtime context is
+        # temporarily unavailable. The multi-node loopback guard below still
+        # prevents a misleading Gloo connection timeout.
+        pass
+
+    node_ip = ray.util.get_node_ip_address()
+    try:
+        is_loopback = ipaddress.ip_address(node_ip).is_loopback
+    except ValueError:
+        is_loopback = False
+
+    if len(alive_nodes) > 1 and is_loopback:
+        raise RuntimeError(
+            "Ray reported a loopback worker address in a multi-node cluster: "
+            f"{node_ip}. Start Ray with an explicit --node-ip-address or fix "
+            "the node's hostname mapping."
+        )
+    return node_ip
 
 
 class WorkerMeta(type):
@@ -1628,7 +1672,7 @@ class Worker(metaclass=WorkerMeta):
         if self._actor is None and self._is_ray_actor:
             self._actor = ray.get_actor(self._worker_name, namespace=Cluster.NAMESPACE)
 
-        node_ip = ray.util.get_node_ip_address()
+        node_ip = _get_ray_node_ip_address()
         node_port = self.acquire_free_port()
 
         from ..manager import WorkerInfo

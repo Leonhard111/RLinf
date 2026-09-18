@@ -27,6 +27,7 @@ from rlinf.scheduler import (
 )
 from rlinf.scheduler.manager.coll_manager import CollectiveManager
 from rlinf.scheduler.manager.manager import Manager
+from rlinf.scheduler.worker.worker import _get_ray_node_ip_address
 
 
 def accelerator_is_available():
@@ -128,6 +129,53 @@ class TestWorkerMeta:
         worker = object.__new__(StaticMethodWorker)
         assert worker.add(1, 2) == 3
         assert StaticMethodWorker.add(1, 2) == 3
+
+
+class TestWorkerNodeIp:
+    """Tests for selecting a cluster-reachable worker address."""
+
+    def test_uses_current_node_manager_address(self):
+        """Prefer Ray's node table over a hostname-derived loopback address."""
+        runtime_context = mock.Mock()
+        runtime_context.get_node_id.return_value = "node-108"
+        nodes = [
+            {
+                "Alive": True,
+                "NodeID": "node-102",
+                "NodeManagerAddress": "192.168.50.102",
+            },
+            {
+                "Alive": True,
+                "NodeID": "node-108",
+                "NodeManagerAddress": "192.168.50.108",
+            },
+        ]
+
+        with mock.patch("ray.get_runtime_context", return_value=runtime_context):
+            with mock.patch("ray.nodes", return_value=nodes):
+                with mock.patch(
+                    "ray.util.get_node_ip_address", return_value="127.0.1.1"
+                ) as fallback:
+                    assert _get_ray_node_ip_address() == "192.168.50.108"
+
+        fallback.assert_not_called()
+
+    def test_rejects_loopback_fallback_in_multi_node_cluster(self):
+        """Fail early if a multi-node worker can only advertise loopback."""
+        runtime_context = mock.Mock()
+        runtime_context.get_node_id.return_value = "missing-node"
+        nodes = [
+            {"Alive": True, "NodeID": "node-102"},
+            {"Alive": True, "NodeID": "node-108"},
+        ]
+
+        with mock.patch("ray.get_runtime_context", return_value=runtime_context):
+            with mock.patch("ray.nodes", return_value=nodes):
+                with mock.patch(
+                    "ray.util.get_node_ip_address", return_value="127.0.1.1"
+                ):
+                    with pytest.raises(RuntimeError, match="loopback worker address"):
+                        _get_ray_node_ip_address()
 
 
 class TestManagerNamespace:

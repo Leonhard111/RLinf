@@ -14,6 +14,7 @@
 
 import asyncio
 import gc
+import time
 from collections import defaultdict
 from typing import Any
 
@@ -42,6 +43,7 @@ from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
 from rlinf.utils.data_iter_utils import split_list
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
 from rlinf.utils.env_helpers import HistoryManager, SmoothInterveneController
+from rlinf.utils.latency_logger import get_latency_logger
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
@@ -65,6 +67,15 @@ class EnvWorker(Worker):
         self.train_video_cnt = 0
         self.eval_video_cnt = 0
         self.should_stop = False
+        self.eval_enable_p2p = bool(cfg.runner.get("eval_enable_p2p", False))
+        self.eval_p2p_tensor_actions = bool(
+            cfg.runner.get("eval_p2p_tensor_actions", False)
+        )
+        # The node-specific environment is installed after actor construction.
+        # Create the logger lazily so an AgileX worker does not inherit the
+        # driver's 4090-only log path.
+        self._eval_transport_logger = None
+        self._eval_transport_sequence = 0
 
         self.env_list = []
         self.eval_env_list = []
@@ -333,17 +344,15 @@ class EnvWorker(Worker):
             for actor_rank, _ in actor_splits
         }
         self.pipeline_actor_env_ranks = {
-            actor_rank: sorted(
-                {
-                    logical_src_rank // self.stage_num
-                    for logical_src_rank, _ in CommMapper.get_src_ranks(
-                        batch_size=self.cfg.env.train.total_num_envs,
-                        src_world_size=logical_env_ws,
-                        dst_world_size=actor_ws,
-                        dst_rank=actor_rank,
-                    )
-                }
-            )
+            actor_rank: sorted({
+                logical_src_rank // self.stage_num
+                for logical_src_rank, _ in CommMapper.get_src_ranks(
+                    batch_size=self.cfg.env.train.total_num_envs,
+                    src_world_size=logical_env_ws,
+                    dst_world_size=actor_ws,
+                    dst_rank=actor_rank,
+                )
+            })
             for actor_rank in range(actor_ws)
         }
         self.pipeline_actor_keys = {
@@ -817,13 +826,11 @@ class EnvWorker(Worker):
             self.history_lengths[stage_id] = dict(history_lengths)
 
         if last_run:
-            reward_input.update(
-                {
-                    "last_run": torch.ones(
-                        (self.train_num_envs_per_stage, 1), dtype=torch.bool
-                    )
-                }
-            )
+            reward_input.update({
+                "last_run": torch.ones(
+                    (self.train_num_envs_per_stage, 1), dtype=torch.bool
+                )
+            })
         self.send_to(
             group_name=self.cfg.reward.group_name,
             channel=send_channel,
@@ -1372,6 +1379,27 @@ class EnvWorker(Worker):
 
     @Worker.timer("evaluate")
     def evaluate(self, input_channel: Channel, rollout_channel: Channel):
+        if self._eval_transport_logger is None:
+            self._eval_transport_logger = get_latency_logger("eval_env_transport")
+        action_recv_buffer = None
+        if self.eval_p2p_tensor_actions:
+            if not self.eval_enable_p2p:
+                raise ValueError(
+                    "eval_p2p_tensor_actions requires runner.eval_enable_p2p=true"
+                )
+            if self._world_size != 1 or self.stage_num != 1:
+                raise ValueError(
+                    "eval_p2p_tensor_actions only supports one Env worker and "
+                    "one evaluation pipeline stage"
+                )
+            action_recv_buffer = torch.empty(
+                (
+                    self.eval_batch_size,
+                    self.model_cfg.num_action_chunks,
+                    self.model_cfg.action_dim,
+                ),
+                dtype=torch.float32,
+            )
         eval_metrics = defaultdict(list)
         for eval_rollout_epoch in range(self.eval_rollout_epoch):
             if not self.cfg.env.eval.auto_reset or eval_rollout_epoch == 0:
@@ -1390,30 +1418,56 @@ class EnvWorker(Worker):
                         ),
                         env_infos=infos if isinstance(infos, dict) else None,
                     )
+                    build_started = time.perf_counter()
                     env_batch = env_output.to_dict()
+                    rollout_input = self._build_rollout_input_data(env_batch)
+                    build_finished = time.perf_counter()
+                    send_started = time.perf_counter()
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
-                        data=self._build_rollout_input_data(env_batch),
+                        data=rollout_input,
                         mode="eval",
                         tag="rollout_results",
                         route_key=stage_id if not self.env_decoupled_mode else None,
                         decoupled_mode=self.env_decoupled_mode,
+                        enable_p2p=self.eval_enable_p2p,
                     )
+                    send_finished = time.perf_counter()
+                    self._pending_eval_transport = {
+                        stage_id: {
+                            "build_observation_payload": (
+                                build_finished - build_started
+                            )
+                            * 1000.0,
+                            "send_observation": (send_finished - send_started) * 1000.0,
+                        }
+                    }
 
             for eval_step in range(self.n_eval_chunk_steps):
                 for stage_id in range(self.stage_num):
-                    policy_output = self.recv_from(
-                        group_name=self.cfg.rollout.group_name,
-                        channel=input_channel,
-                        tag="eval_rollout_results",
-                        route_key=stage_id if not self.env_decoupled_mode else None,
-                        batch_size=self.eval_batch_size,
-                        infer_batch_size_fn=self._infer_rollout_batch_size
-                        if self.env_decoupled_mode
-                        else None,
-                        decoupled_mode=self.env_decoupled_mode,
-                    )
+                    turn_started = time.perf_counter()
+                    if self.eval_p2p_tensor_actions:
+                        self.recv_tensor(
+                            action_recv_buffer,
+                            src_group_name=self.cfg.rollout.group_name,
+                            src_rank=0,
+                        )
+                        policy_output = action_recv_buffer
+                    else:
+                        policy_output = self.recv_from(
+                            group_name=self.cfg.rollout.group_name,
+                            channel=input_channel,
+                            tag="eval_rollout_results",
+                            route_key=stage_id if not self.env_decoupled_mode else None,
+                            batch_size=self.eval_batch_size,
+                            infer_batch_size_fn=self._infer_rollout_batch_size
+                            if self.env_decoupled_mode
+                            else None,
+                            decoupled_mode=self.env_decoupled_mode,
+                            enable_p2p=self.eval_enable_p2p,
+                        )
+                    action_received = time.perf_counter()
                     raw_chunk_actions = (
                         policy_output.actions
                         if hasattr(policy_output, "actions")
@@ -1423,8 +1477,40 @@ class EnvWorker(Worker):
                         raw_chunk_actions = raw_chunk_actions.detach().cpu().numpy()
                     else:
                         raw_chunk_actions = np.asarray(raw_chunk_actions)
+                    action_converted = time.perf_counter()
                     env_output, env_info = self.env_evaluate_step(
                         raw_chunk_actions, stage_id
+                    )
+                    env_step_finished = time.perf_counter()
+
+                    pending = self._pending_eval_transport.get(stage_id, {})
+                    self._eval_transport_sequence += 1
+                    self._eval_transport_logger.record(
+                        {
+                            **pending,
+                            "wait_action_roundtrip": (action_received - turn_started)
+                            * 1000.0,
+                            "action_to_numpy": (action_converted - action_received)
+                            * 1000.0,
+                            "env_chunk_step": (env_step_finished - action_converted)
+                            * 1000.0,
+                            "turn_until_env_step_done": (
+                                env_step_finished - turn_started
+                            )
+                            * 1000.0,
+                        },
+                        trace_id=self._eval_transport_sequence,
+                        metadata={
+                            "stage_id": stage_id,
+                            "eval_step": eval_step,
+                            "transport": (
+                                "p2p_tensor_action"
+                                if self.eval_p2p_tensor_actions
+                                else "p2p"
+                                if self.eval_enable_p2p
+                                else "channel"
+                            ),
+                        },
                     )
 
                     for key, value in env_info.items():
@@ -1439,16 +1525,27 @@ class EnvWorker(Worker):
                     else:
                         if eval_step == self.n_eval_chunk_steps - 1:
                             continue
+                    build_started = time.perf_counter()
                     env_batch = env_output.to_dict()
+                    rollout_input = self._build_rollout_input_data(env_batch)
+                    build_finished = time.perf_counter()
+                    send_started = time.perf_counter()
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
-                        data=self._build_rollout_input_data(env_batch),
+                        data=rollout_input,
                         mode="eval",
                         tag="rollout_results",
                         route_key=stage_id if not self.env_decoupled_mode else None,
                         decoupled_mode=self.env_decoupled_mode,
+                        enable_p2p=self.eval_enable_p2p,
                     )
+                    send_finished = time.perf_counter()
+                    self._pending_eval_transport[stage_id] = {
+                        "build_observation_payload": (build_finished - build_started)
+                        * 1000.0,
+                        "send_observation": (send_finished - send_started) * 1000.0,
+                    }
 
             self.finish_rollout(mode="eval")
         for stage_id in range(self.stage_num):
@@ -1552,9 +1649,9 @@ class EnvWorker(Worker):
         with self.worker_timer("prepare_micro_batches"):
             for stage_id, trajectory_builder in enumerate(trajectory_builders):
                 actor_splits = self.pipeline_stage_actor_splits[stage_id]
-                trajectories = trajectory_builder.to_splited_trajectories_by_sizes(
-                    [split_size for _, split_size in actor_splits]
-                )
+                trajectories = trajectory_builder.to_splited_trajectories_by_sizes([
+                    split_size for _, split_size in actor_splits
+                ])
 
                 for (actor_rank, _), trajectory in zip(actor_splits, trajectories):
                     batch = self.prepare_pipeline_batch(trajectory)

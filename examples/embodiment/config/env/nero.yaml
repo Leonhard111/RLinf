@@ -1,0 +1,43 @@
+env_type: realworld
+
+total_num_envs: 1
+auto_reset: false
+ignore_terminations: false
+reward_mode: raw
+wrap_obs_mode: simple
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: false
+max_steps_per_rollout_epoch: 300
+max_episode_steps: 300
+use_spacemouse: false
+no_gripper: false
+main_image_key: cam_high
+model_state_keys: [puppet]
+wrist_image_keys: [cam_left_wrist, cam_right_wrist]
+
+video_cfg:
+  save_video: false
+  info_on_video: true
+  video_base_dir: ${runner.logger.log_path}/video/eval
+
+init_params:
+  id: NeroEnv-v1
+  num_envs: null
+
+override_cfg:
+  # dummy is software-only. shadow/publish must match the host bridge mode.
+  mode: dummy
+  bridge_endpoint: tcp://127.0.0.1:5555
+  bridge_connect_timeout_s: 2.0
+  bridge_request_timeout_s: 10.0
+  heartbeat_interval_s: 0.1
+  heartbeat_timeout_s: 0.2
+  task_description: Nero manipulation task
+  max_num_steps: 300
+  action_representation: absolute
+  image_height: 720
+  image_width: 1280
+  max_observation_age_s: 0.25
+  max_camera_age_s: 0.25
+  max_camera_skew_s: 0.10

@@ -1,0 +1,116 @@
+defaults:
+  - env/nero@env.eval
+  - model/pi0_5_rlinf@rollout.model
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+# Preserve RLinf's two-node embodied layout: rollout/model inference stays on
+# the 4090 node, while the environment worker stays on the AgileX node. RLinf's
+# existing Ray/collective path carries observations and actions across machines;
+# the Nero TCP bridge is loopback-only inside the AgileX host.
+cluster:
+  num_nodes: 2
+  component_placement:
+    rollout:
+      node_group: gpu
+      placement: 0
+    env:
+      node_group: nero
+      placement: 0
+  node_groups:
+    - label: gpu
+      node_ranks: 0
+      env_configs:
+        - node_ranks: 0
+          env_vars:
+            - GLOO_SOCKET_IFNAME: enp0s31f6
+    - label: nero
+      node_ranks: 1
+      env_configs:
+        - node_ranks: 1
+          env_vars:
+            - GLOO_SOCKET_IFNAME: eno1
+
+runner:
+  task_type: embodied_eval
+  # Eval has one Env worker and one Rollout worker, so direct Gloo P2P avoids
+  # the two central Ray ChannelWorker hops without changing model or actions.
+  eval_enable_p2p: true
+  # The current deployment has one Env worker, one Rollout worker and a fixed
+  # [1, 50, 16] float32 action tensor. Reuse that contract to avoid sending
+  # redundant type/shape/dtype metadata with every 3.2 KB action response.
+  eval_p2p_tensor_actions: true
+  logger:
+    log_path: ../results
+    project_name: rlinf
+    experiment_name: nero_pi05_lora_native_shadow
+    logger_backends: [tensorboard]
+  only_eval: true
+  max_epochs: 1
+  max_steps: 50
+  val_check_interval: -1
+  save_interval: -1
+
+env:
+  group_name: EnvGroup
+  enable_offload: false
+  eval:
+    total_num_envs: 1
+    max_steps_per_rollout_epoch: 50
+    max_episode_steps: 50
+    video_cfg:
+      save_video: false
+    override_cfg:
+      mode: shadow
+      bridge_endpoint: tcp://127.0.0.1:5555
+      bridge_connect_timeout_s: 2.0
+      # One client step waits while the native controller executes 30/50 TOPP
+      # targets. Low-speed hardware validation can therefore exceed 10 s.
+      bridge_request_timeout_s: 120.0
+      action_representation: absolute
+      heartbeat_interval_s: 0.1
+      heartbeat_timeout_s: 0.2
+      task_description: First, place the red square on the green square, and then put the blue square on the red square.
+      # The native bridge resizes with OpenPI's aspect-preserving pad before
+      # transport. The model consumes 224x224, so shipping 640x480 only adds two
+      # full-frame transfers and repeated copies without adding model detail.
+      image_height: 224
+      image_width: 224
+
+rollout:
+  group_name: RolloutGroup
+  backend: huggingface
+  recompute_logprobs: false
+  enable_offload: false
+  pipeline_stage_num: 1
+  collect_transitions: false
+  collect_prev_infos: false
+  model:
+    model_type: openpi_rlinf
+    model_path: /workspace/fjh/checkpoints/nero_pi05_30000_openpi_rlinf
+    precision: bf16
+    pi05: true
+    num_action_chunks: 50
+    action_dim: 16
+    use_proprio: true
+    num_steps: 5
+    add_value_head: false
+    openpi_data:
+      norm_stats_path: ${..model_path}/local/nero_aloha16/norm_stats.json
+    openpi:
+      task: eval
+      config_name: pi05_nero
+      num_images_in_input: 3
+      action_chunk: ${..num_action_chunks}
+      action_env_dim: ${..action_dim}
+      model_action_dim: 32
+      paligemma_variant: gemma_2b
+      action_expert_variant: gemma_300m
+      max_token_len: 200
+      discrete_state_input: true

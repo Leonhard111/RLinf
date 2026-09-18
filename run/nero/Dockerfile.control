@@ -1,0 +1,10 @@
+ARG BASE_IMAGE=rlinf/rlinf:agentic-rlinf0.4-maniskill_libero
+FROM ${BASE_IMAGE}
+
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
+SHELL ["/bin/bash", "-lc"]
+RUN source switch_env openpi \
+    && python -m pip install --no-cache-dir \
+        --index-url "${PIP_INDEX_URL}" \
+        pyzmq==27.1.0

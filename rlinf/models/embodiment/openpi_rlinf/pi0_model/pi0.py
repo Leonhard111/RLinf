@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..rtc import guided_velocity
 from . import gemma, model, pointnet, siglip
 from .pi0_config import Pi0Config
 from .utils import _str_to_dtype
@@ -494,6 +495,76 @@ class Pi0(model.BaseModel):
             x_t = x_t + dt * v_t
             t = t + dt
 
+        return x_t
+
+    def sample_actions_rtc(
+        self,
+        observation: model.Observation,
+        *,
+        previous_aligned: torch.Tensor,
+        inference_delay_steps: int,
+        prefix_attention_horizon: int,
+        prefix_attention_schedule: str = "exp",
+        max_guidance_weight: float = 5.0,
+        num_steps: int = 10,
+        noise: torch.Tensor | None = None,
+        rng: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """Sample one chunk with VJP guidance from the aligned previous chunk."""
+
+        observation = model.preprocess_observation(observation, train=False)
+        batch_size = observation.state.shape[0]
+        device = observation.state.device
+        if noise is None:
+            noise = torch.randn(
+                batch_size,
+                self.action_horizon,
+                self.action_dim,
+                device=device,
+                generator=rng,
+            )
+        previous_aligned = previous_aligned.to(
+            device=device,
+            dtype=noise.dtype,
+        )
+        if previous_aligned.shape != noise.shape:
+            raise ValueError(
+                "RTC previous model chunk shape does not match the π0.5 sampler"
+            )
+
+        _, prefix_mask, kv_cache = self.build_prefix_cache(observation)
+        x_t = noise
+        dt = -1.0 / num_steps
+        for step in range(num_steps):
+            time_value = 1.0 + step * dt
+            time_tensor = torch.full(
+                (batch_size,),
+                time_value,
+                device=device,
+                dtype=torch.float32,
+            )
+
+            def denoise_fn(value: torch.Tensor) -> torch.Tensor:
+                suffix = self.run_suffix(
+                    observation,
+                    value,
+                    time_tensor,
+                    kv_cache,
+                    prefix_mask,
+                )
+                return self.velocity_from_suffix(suffix)
+
+            velocity = guided_velocity(
+                x_t,
+                previous_aligned,
+                inference_delay_steps=inference_delay_steps,
+                prefix_attention_horizon=prefix_attention_horizon,
+                time=time_value,
+                schedule=prefix_attention_schedule,
+                max_guidance_weight=max_guidance_weight,
+                denoise_fn=denoise_fn,
+            )
+            x_t = (x_t + dt * velocity).detach()
         return x_t
 
     def forward(
