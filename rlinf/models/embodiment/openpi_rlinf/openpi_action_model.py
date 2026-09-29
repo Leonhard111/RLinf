@@ -91,6 +91,55 @@ class OpenPiPytorchActionModel(nn.Module):
             path_parts = name.split(".")
             setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
 
+    def freeze_vlm(self) -> int:
+        """Freeze the vision encoder and Gemma expert-0, leaving action-side
+        parameters and the optional RLT module trainable.
+
+        Returns the number of newly frozen parameter tensors.
+        """
+        frozen = 0
+        for param in self.model.img.parameters():
+            if param.requires_grad:
+                param.requires_grad = False
+                frozen += 1
+
+        llm = self.model.llm
+        for param in llm.embedder.parameters():
+            if param.requires_grad:
+                param.requires_grad = False
+                frozen += 1
+
+        # Gemma expert 0 is the PaliGemma VLM; expert 1 generates actions.
+        for block in llm.layers:
+            for module in (
+                block.pre_attention_norms[0],
+                block.pre_ffw_norms[0],
+                block.mlps[0],
+            ):
+                for param in module.parameters():
+                    if param.requires_grad:
+                        param.requires_grad = False
+                        frozen += 1
+            for projections in (
+                block.attn.q_proj,
+                block.attn.k_proj,
+                block.attn.v_proj,
+                block.attn.o_proj,
+            ):
+                module = projections[0]
+                if module is not None:
+                    for param in module.parameters():
+                        if param.requires_grad:
+                            param.requires_grad = False
+                            frozen += 1
+
+        if llm.final_norms[0] is not None:
+            for param in llm.final_norms[0].parameters():
+                if param.requires_grad:
+                    param.requires_grad = False
+                    frozen += 1
+        return frozen
+
     # --- Gradient checkpointing pass-through (used by the FSDP training path) ---
     def gradient_checkpointing_enable(
         self, gradient_checkpointing_kwargs: dict | None = None, **kwargs
