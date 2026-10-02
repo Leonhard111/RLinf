@@ -64,6 +64,9 @@ from rlinf.models.embodiment.openpi.dataconfig.metaworld_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.nero_dataconfig import (
     LeRobotNeroDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.nero_right_dataconfig import (
+    LeRobotNeroRightDataConfig,
+)
 from rlinf.models.embodiment.openpi.dataconfig.polaris_dataconfig import (
     LeRobotPolarisDroidDataConfig,
 )
@@ -468,6 +471,22 @@ _CONFIGS = [
                 asset_id="local/nero_aloha16",
             ),
             extra_delta_transform=True,
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi05_nero_right",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=50, discrete_state_input=True
+        ),
+        data=LeRobotNeroRightDataConfig(
+            repo_id="local/nero_right_stack2item",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="checkpoints/torch/pi05_nero_right",
+                asset_id="local/nero_right_stack2item",
+            ),
         ),
         pytorch_weight_path="checkpoints/torch/pi05_base",
         num_train_steps=20_000,

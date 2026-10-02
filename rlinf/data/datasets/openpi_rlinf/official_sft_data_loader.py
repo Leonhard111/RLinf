@@ -44,6 +44,9 @@ def build_official_openpi_sft_dataloader(
     import openpi.training.data_loader as openpi_data_loader
 
     from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
+    from rlinf.models.embodiment.openpi.dataconfig.nero_right_dataconfig import (
+        LeRobotNeroRightDataConfig,
+    )
 
     model_cfg = cfg.actor.model
     model_type = SupportedModel(model_cfg.model_type)
@@ -58,6 +61,13 @@ def build_official_openpi_sft_dataloader(
         repo_id=repo_id,
         data_kwargs=getattr(model_cfg, "openpi_data", None),
     )
+    if eval_dataset and isinstance(config.data, LeRobotNeroRightDataConfig):
+        config = dataclasses.replace(
+            config,
+            data=dataclasses.replace(
+                config.data, wrist_dropout_prob=0.0, state_dropout_prob=0.0
+            ),
+        )
     if model_type == SupportedModel.OPENPI_RLINF:
         config = dataclasses.replace(
             config,

@@ -205,7 +205,7 @@ def preprocess_observation(
     observation: Observation,
     *,
     train: bool = False,
-    image_keys: Sequence[str] = IMAGE_KEYS,
+    image_keys: Sequence[str] | None = None,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
     rng: torch.Generator | None = None,
 ) -> Observation:
@@ -214,6 +214,14 @@ def preprocess_observation(
     For training, applies random crop, rotate, and color jitter augmentations.
     Resizes images to the target resolution with padding.
     """
+    if image_keys is None:
+        cameras = set(observation.images)
+        if cameras == set(IMAGE_KEYS):
+            image_keys = IMAGE_KEYS
+        elif cameras == {"base_0_rgb", "right_wrist_0_rgb"}:
+            image_keys = ("base_0_rgb", "right_wrist_0_rgb")
+        else:
+            raise ValueError(f"Unsupported image keys: {list(observation.images)}")
     if not set(image_keys).issubset(observation.images):
         raise ValueError(
             f"images dict missing keys: expected {image_keys}, got {list(observation.images)}"
