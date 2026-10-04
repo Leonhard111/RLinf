@@ -1,0 +1,91 @@
+defaults:
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 0-0
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf-nero
+    experiment_name: "nero_sft_openpi_pi05"
+    logger_backends: ["tensorboard"]
+  max_epochs: -1
+  max_steps: 30000
+  val_check_interval: -1
+  save_interval: 5000
+
+data:
+  # LeRobot root produced by convert_nero_capture_to_lerobot.py.
+  train_data_paths: "/path/to/nero_data_new_lerobot"
+  num_workers: 4
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 16
+  global_batch_size: 64
+  seed: 42
+
+  model:
+    model_type: "openpi_rlinf"
+    precision: fp32
+    is_lora: False
+    model_path: "/path/to/pi05-base-model"
+    num_action_chunks: 50
+    action_dim: 16
+    num_steps: 5
+    add_value_head: False
+    openpi_data:
+      repo_id: "local/nero_data_new_lerobot"
+      # Directory containing norm_stats.json produced for train_data_paths.
+      norm_stats_path: "/path/to/nero_data_new_lerobot"
+    openpi:
+      task: sft
+      config_name: "pi05_nero"
+      num_images_in_input: 3
+      train_expert_only: False
+      action_horizon: ${actor.model.num_action_chunks}
+      action_chunk: ${actor.model.num_action_chunks}
+      action_env_dim: ${actor.model.action_dim}
+      model_action_dim: 32
+      num_steps: ${actor.model.num_steps}
+      paligemma_variant: "gemma_2b"
+      action_expert_variant: "gemma_300m"
+      max_token_len: 200
+      discrete_state_input: True
+
+  optim:
+    lr: 2.5e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    total_training_steps: ${runner.max_steps}
+    lr_warmup_steps: 1000
+    lr_scheduler: "cosine"
+    num_cycles: 0.5
+    min_lr: 2.5e-6
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: fp32
