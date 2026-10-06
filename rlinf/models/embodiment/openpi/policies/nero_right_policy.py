@@ -23,13 +23,23 @@ class NeroRightInputs(transforms.DataTransformFn):
     """Map the compact LeRobot record to the two-camera OpenPI contract."""
 
     def __call__(self, data: dict) -> dict:
-        images = data["images"]
+        if "observation/state" in data:
+            wrist = _convert_image(data["observation/wrist_image"])
+            if wrist.ndim != 4 or wrist.shape[0] != 1:
+                raise ValueError("Right-arm wrist image must have shape [1, H, W, 3]")
+            images = {
+                "cam_high": data["observation/image"],
+                "cam_right_wrist": wrist[0],
+            }
+            state = np.asarray(data["observation/state"], dtype=np.float32)
+        else:
+            images = data["images"]
+            state = np.asarray(data["state"], dtype=np.float32)
         expected = {"cam_high", "cam_right_wrist"}
         if set(images) != expected:
             raise ValueError(
                 f"Expected cameras {sorted(expected)}, got {sorted(images)}"
             )
-        state = np.asarray(data["state"], dtype=np.float32)
         if state.shape != (RIGHT_DIM,) or not np.isfinite(state).all():
             raise ValueError(
                 f"Right-arm state must be finite [{RIGHT_DIM}], got {state.shape}"
