@@ -13,8 +13,8 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    # Use the third physical GPU on the shared five-GPU host.
-    actor: 2-2
+    # Use physical GPUs 3 and 4 on the shared five-GPU host.
+    actor: 3-4
 
 runner:
   task_type: sft
@@ -34,8 +34,8 @@ data:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 1
-  global_batch_size: 16
+  micro_batch_size: 16
+  global_batch_size: 32
   seed: 42
 
   model:
@@ -52,6 +52,7 @@ actor:
       norm_stats_path: ${oc.env:NERO_RIGHT_DATASET}
       wrist_dropout_prob: 0.1
       state_dropout_prob: 0.1
+      use_delta_joint_actions: false
     openpi:
       task: sft
       config_name: "pi05_nero_right"
@@ -90,7 +91,7 @@ actor:
     sharding_strategy: "no_shard"
     # Gemma blocks contain both frozen VLM and trainable action-expert parameters.
     use_orig_params: True
-    # Keep activation memory within one RTX 4090 while micro-batch stays at 1.
+    # Keep the 16-sample per-rank micro-batch within each 48 GiB GPU.
     gradient_checkpointing: True
     mixed_precision:
       param_dtype: bf16

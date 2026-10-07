@@ -26,6 +26,7 @@ class LeRobotNeroRightDataConfig(DataConfigFactory):
     default_prompt: str | None = None
     wrist_dropout_prob: float = 0.0
     state_dropout_prob: float = 0.0
+    use_delta_joint_actions: bool = True
     repack_transforms: _transforms.Group = dataclasses.field(
         default_factory=lambda: _transforms.Group(
             inputs=[
@@ -50,16 +51,13 @@ class LeRobotNeroRightDataConfig(DataConfigFactory):
     ) -> DataConfig:
         data_transforms = _transforms.Group(
             inputs=[NeroRightInputs()], outputs=[NeroRightOutputs()]
-        ).push(
-            inputs=[
-                _transforms.DeltaActions(np.asarray([True] * 7 + [False], dtype=bool))
-            ],
-            outputs=[
-                _transforms.AbsoluteActions(
-                    np.asarray([True] * 7 + [False], dtype=bool)
-                )
-            ],
         )
+        if self.use_delta_joint_actions:
+            joint_mask = np.asarray([True] * 7 + [False], dtype=bool)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(joint_mask)],
+                outputs=[_transforms.AbsoluteActions(joint_mask)],
+            )
         standard = ModelTransformFactory(default_prompt=self.default_prompt)(
             model_config
         )
