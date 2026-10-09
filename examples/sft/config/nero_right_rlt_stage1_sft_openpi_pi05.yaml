@@ -52,7 +52,6 @@ actor:
       norm_stats_path: ${oc.env:NERO_RIGHT_DATASET}
       wrist_dropout_prob: 0.1
       state_dropout_prob: 0.1
-      use_delta_joint_actions: false
     openpi:
       task: sft
       config_name: "pi05_nero_right"

@@ -55,7 +55,6 @@ exec docker run --rm "${tty_args[@]}" \
       cluster.component_placement.actor=2-2 \
       actor.micro_batch_size=1 \
       actor.global_batch_size=16 \
-      actor.model.openpi_data.use_delta_joint_actions=true \
       actor.fsdp_config.gradient_checkpointing=True \
       "$@"
   ' -- "$@"

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Host-side launcher for Nero right-arm absolute-action RLT Stage 1 on GPUs 3-4.
+# Host-side launcher for Nero right-arm RLT Stage 1 on GPUs 3-4.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IMAGE="${RLINF_IMAGE:-rlinf/rlinf:agentic-rlinf0.4-maniskill_libero}"
-DATASET_HOST="${NERO_RIGHT_DATASET_HOST:-/home/ubuntu/fjh/workbench/data/0929_red_on_green_right_lerobot_structural_pass_abs_wide20}"
+DATASET_HOST="${NERO_RIGHT_DATASET_HOST:-/home/ubuntu/fjh/workbench/data/0929_red_on_green_right_lerobot_structural_pass_norm_wide20}"
 CHECKPOINT_HOST="${NERO_PI05_CHECKPOINT_HOST:-/home/ubuntu/lxd_shared/pi_origin/pi05_base}"
 LOGS_HOST="${ROOT}/logs"
 
@@ -31,7 +31,7 @@ echo "GPU 3-4 status before launch:"
 nvidia-smi --id=3,4 \
   --query-gpu=index,name,memory.used,memory.free,utilization.gpu \
   --format=csv,noheader
-echo "YAML defaults: global_batch=32, per-GPU micro_batch=16, accumulation=1, absolute actions"
+echo "YAML defaults: global_batch=32, per-GPU micro_batch=16, accumulation=1, delta joint actions"
 echo "Command-line overrides: $*"
 
 tty_args=()
