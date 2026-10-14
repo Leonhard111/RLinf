@@ -72,17 +72,36 @@ def main() -> int:
         "--mode", choices=("offline", "shadow", "publish"), default="offline"
     )
     parser.add_argument("--endpoint", default="tcp://192.168.50.108:5555")
+    parser.add_argument("--bridge-request-timeout-s", type=float, default=180.0)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument(
         "--max-generations", type=int, default=1, help="0 runs until Ctrl+C"
     )
     parser.add_argument("--num-steps", type=int, default=5)
     parser.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
+    parser.add_argument(
+        "--compile-suffix",
+        action="store_true",
+        help="experiment: compile the pi0.5 action-expert suffix and warm it before inference",
+    )
+    parser.add_argument(
+        "--compile-prefix",
+        action="store_true",
+        help="experiment: also compile the visual prefix; requires --compile-suffix",
+    )
     args = parser.parse_args()
-    if args.max_generations < 0 or args.num_steps < 1 or not args.prompt.strip():
+    if (
+        args.max_generations < 0
+        or args.num_steps < 1
+        or args.bridge_request_timeout_s <= 0
+        or not args.prompt.strip()
+    ):
         parser.error(
-            "max-generations must be nonnegative; num-steps and prompt must be valid"
+            "max-generations must be nonnegative; num-steps, bridge timeout, "
+            "and prompt must be valid"
         )
+    if args.compile_prefix and not args.compile_suffix:
+        parser.error("--compile-prefix requires --compile-suffix")
     for path in (args.checkpoint, args.norm_stats):
         if not path.is_file():
             parser.error(f"Missing file: {path}")
@@ -100,12 +119,25 @@ def main() -> int:
         .to("cuda")
         .eval()
     )
+    if args.compile_suffix:
+        from experiments.pi05_latency.runtime import compile_and_warm_model
+
+        warmup_observation = offline_observation(args.norm_stats, args.prompt)
+        cold_start_s = compile_and_warm_model(
+            model,
+            right_model_observation(warmup_observation),
+            compile_prefix=args.compile_prefix,
+        )
+        label = "compiled_prefix_suffix" if args.compile_prefix else "compiled_suffix"
+        print(f"{label}_warmup_s={cold_start_s:.1f}", flush=True)
     client = None
     try:
         if args.mode == "offline":
             observation = offline_observation(args.norm_stats, args.prompt)
         else:
-            client = NeroRobotClient(args.endpoint, request_timeout_s=30.0)
+            client = NeroRobotClient(
+                args.endpoint, request_timeout_s=args.bridge_request_timeout_s
+            )
             expected = (
                 ControlMode.SHADOW if args.mode == "shadow" else ControlMode.PUBLISH
             )

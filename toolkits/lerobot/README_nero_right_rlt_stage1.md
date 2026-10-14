@@ -33,7 +33,7 @@ conda run -n lerobot python toolkits/lerobot/prepare_nero_right_dataset.py conve
   --selection ~/fjh/workbench/data/0929_stack2item_audit_deep_final/selection.csv \
   --output ~/fjh/workbench/data/0929_stack2item_right_lerobot \
   --repo-id local/nero_right_stack2item \
-  --task 'Place the red square on the green square, then put the blue square on the red square.'
+  --task 'Stack the red square on top of the green square.'
 ```
 
 请先确认该英文任务描述与实际采集指令一致。输出目录必须是新目录且位于原始目录之外；程序不会覆盖已有输出。转换依据均匀 30 Hz 时间轴，就近对齐前视、右腕、`puppetRight.position`（观察）和 `masterRight.position`（专家动作）。图像按比例双线性缩放并居中补黑到 224×224，编码为 LeRobot MP4；OpenPI 的 224 resize 随后基本是恒等变换。保留 8D 绝对目标，OpenPI 数据变换再将前 7 维转为相对当前关节的 delta，夹爪保持绝对值。`norm_stats.json` 按 50-step delta action 和状态一起写出。每条 episode 的采样长度与源映射记录在 `conversion_manifest.json`。
