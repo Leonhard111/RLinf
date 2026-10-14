@@ -100,3 +100,12 @@ bash examples/sft/run_nero_right_rlt_stage1_gpu2_docker.sh
 - 尚未在 GPU2 上启动训练或单步 smoke test，以免干扰当前占用 GPU 的其他任务。
 - 99 条候选数据尚未逐条做成功率和动作质量筛选；结构通过不等于专家示范优质。
 - 新模型是两相机、右臂 8D 接口，当前三相机、双臂真机部署桥仍需后续适配。
+
+## GPU 3–4 训练入口
+
+`examples/sft/run_nero_right_rlt_stage1_gpu34_docker.sh` 默认使用同一份
+`0929_red_on_green_right_lerobot_structural_pass_norm_wide20` 数据集及其
+delta action 统计量。训练配置默认 global batch 32、每卡 micro batch 16；
+显存不足时可在命令末尾覆盖 `actor.micro_batch_size=4`，保持 global batch 32。
+使用 `NERO_RIGHT_DATASET_HOST` 覆盖数据路径时，须确认其中的
+`norm_stats.json` 对应前 7 维关节增量。
