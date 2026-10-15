@@ -189,6 +189,7 @@ class FSDPStrategyBase(ABC):
         save_path: str,
         save_full_model_weights: bool = True,
         checkpoint_format: str = "dcp",
+        save_training_state: bool = True,
     ) -> None:
         """
         Save the training state checkpoint.
@@ -206,8 +207,28 @@ class FSDPStrategyBase(ABC):
             save_path (str): The path to save the checkpoint.
             save_full_model_weights (bool): Whether to save full model weights.
             checkpoint_format (str): "dcp" or "local_shard".
+            save_training_state (bool): Whether to save sharded optimizer and
+                scheduler state. False exports full model weights only.
         """
         clear_memory()
+        if not save_training_state:
+            if not save_full_model_weights:
+                raise ValueError(
+                    "save_training_state=False requires save_full_model_weights=True"
+                )
+            torch.distributed.barrier()
+            opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            model_state_dict = get_model_state_dict(model=model, options=opts)
+            if torch.distributed.get_rank() == 0:
+                sd_save_path = os.path.join(save_path, "model_state_dict")
+                os.makedirs(sd_save_path, exist_ok=True)
+                weights_path = os.path.join(sd_save_path, "full_weights.pt")
+                if Worker.torch_device_type == "npu":
+                    cls.save_npu_weight(model_state_dict, weights_path)
+                else:
+                    torch.save(model_state_dict, weights_path)
+            torch.distributed.barrier()
+            return
         torch.distributed.barrier()
         opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
         try:

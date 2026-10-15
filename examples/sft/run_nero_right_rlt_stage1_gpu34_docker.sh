@@ -39,7 +39,19 @@ if [[ -t 0 && -t 1 ]]; then
   tty_args=(-it)
 fi
 
-exec docker run --rm "${tty_args[@]}" \
+docker_resource_args=()
+if [[ -n "${NERO_DOCKER_NAME:-}" ]]; then
+  docker_resource_args+=(--name "${NERO_DOCKER_NAME}")
+fi
+if [[ -n "${NERO_DOCKER_CPUS:-}" ]]; then
+  docker_resource_args+=(--cpus "${NERO_DOCKER_CPUS}")
+fi
+if [[ -n "${NERO_DOCKER_MEMORY:-}" ]]; then
+  docker_resource_args+=(--memory "${NERO_DOCKER_MEMORY}")
+  docker_resource_args+=(--memory-swap "${NERO_DOCKER_MEMORY_SWAP:-${NERO_DOCKER_MEMORY}}")
+fi
+
+exec docker run --rm "${tty_args[@]}" "${docker_resource_args[@]}" \
   --gpus all \
   --shm-size=20g \
   --network host \

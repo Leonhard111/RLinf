@@ -91,7 +91,27 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     pi0_config = Pi0Config(**pi0_kwargs)
     model = pi0_config.create()
     if safetensors_path is not None and full_weights_path is None:
-        load_base_safetensors(model, safetensors_path)
+        load_on_rank0_only = bool(
+            OmegaConf.select(cfg, "load_base_on_rank0_only", default=False)
+        )
+        should_load = True
+        if load_on_rank0_only:
+            import torch.distributed as dist
+
+            if not dist.is_available() or not dist.is_initialized():
+                raise RuntimeError(
+                    "load_base_on_rank0_only requires an initialized distributed "
+                    "process group and FSDP sync_module_states=True"
+                )
+            should_load = dist.get_rank() == 0
+            if not should_load:
+                logger.info(
+                    "openpi_rlinf: rank %d skips base checkpoint load; "
+                    "FSDP sync_module_states must copy rank-0 weights",
+                    dist.get_rank(),
+                )
+        if should_load:
+            load_base_safetensors(model, safetensors_path)
     n_params = sum(param.numel() for param in model.parameters())
     if target_dtype is not None:
         model = model.to(target_dtype)
